@@ -6,6 +6,7 @@ from typing import Any, Union
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security.utils import get_authorization_scheme_param
 from langchain.callbacks import get_openai_callback
+from langchain.chains.base import Chain
 from langchain.schema import messages_from_dict, messages_to_dict
 from loguru import logger
 from pydantic import BaseModel
@@ -80,18 +81,32 @@ class FnWrapper:
         return r.dict()
 
 
-def derive_fields(language_app) -> (list[str], list[str]):
+def _derive_output(language_app: Chain) -> list[str]:
+    if hasattr(language_app, "output_variables"):
+        return language_app.output_variables
+    elif hasattr(language_app, "output_keys"):
+        return language_app.output_keys
+    elif hasattr(language_app, "output_key"):
+        return language_app.output_key
+    return ["output"]
+
+
+def derive_fields(language_app: Chain) -> (list[str], list[str]):
     if hasattr(language_app, "input_variables"):
-        return language_app.input_variables, language_app.output_variables
+        return language_app.input_variables, _derive_output(language_app)
     elif hasattr(language_app, "prompt"):
         return language_app.prompt.input_variables, [language_app.output_key]
-    return [language_app.input_key], ["output"]
+    elif hasattr(language_app, "input_keys"):
+        return language_app.input_keys, _derive_output(language_app)
+    return [language_app.input_key], _derive_output(language_app)
 
 
-def derive_class(name, fields, add_memory=False):
+def derive_class(name, fields, add_memory=False) -> BaseModel:
     annotations = {f: str for f in fields}
     if add_memory:
         annotations["memory"] = list[dict]
+    if "chat_history" in annotations:
+        annotations["chat_history"] = list[list[str]]
     return type(f"Lang{name}", (BaseModel,), {"__annotations__": annotations})
 
 
@@ -133,6 +148,11 @@ def configure_llm(chain, http_headers: dict[str, str]):
     return False
 
 
+def add_chat_history(run_params):
+    if "chat_history" in run_params:
+        run_params["chat_history"] = [tuple(t) for t in run_params["chat_history"]]
+
+
 def make_handler(request_cls, chain):
     async def handler(request: request_cls, http_request: Request):
         llm_api_key = http_request.headers.get("x-llm-api-key")
@@ -144,6 +164,7 @@ def make_handler(request_cls, chain):
             memory = run_params.pop("memory", [])
             if chain.memory and memory and memory[0]:
                 chain.memory.chat_memory.messages = messages_from_dict(memory)
+            add_chat_history(run_params)
             with get_openai_callback() as cb:
                 if not retrieval_chain:
                     output = chain.run(run_params)
